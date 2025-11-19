@@ -610,17 +610,17 @@ def main():
             )
 
         st.subheader("📄 Facturas no conciliadas en el extracto")
-if fact_sin_usar.empty:
-    st.info("Todas las facturas han sido usadas en la conciliación.")
-else:
-    # Elegimos las columnas clave a mostrar
-    cols_fact = ["Fecha", "Importe", "Proveedor", "NumFactura"]
-    cols_fact = [c for c in cols_fact if c in fact_sin_usar.columns]
+            if fact_sin_usar.empty:
+        st.info("Todas las facturas han sido usadas en la conciliación.")
+            else:
+            # Elegimos las columnas clave a mostrar
+            cols_fact = ["Fecha", "Importe", "Proveedor", "NumFactura"]
+            cols_fact = [c for c in cols_fact if c in fact_sin_usar.columns]
 
-    st.dataframe(
-        fact_sin_usar[cols_fact],
-        use_container_width=True,
-    )
+        st.dataframe(
+            fact_sin_usar[cols_fact],
+            use_container_width=True,
+        )
 
     # ==========================================
     # TAB 2: Reclamaciones
