@@ -1,6 +1,11 @@
+import os
+import json
+from datetime import timedelta
+
 import pandas as pd
 import streamlit as st
-from datetime import timedelta
+from openai import OpenAI
+
 
 # ==============================================
 # Utilidades de normalización
@@ -76,12 +81,6 @@ def cargar_facturas(file) -> pd.DataFrame:
     """
     Carga y normaliza el listado de facturas a columnas:
     Fecha, Importe, Proveedor, NumFactura, fact_id
-
-    Adaptado a formato típico:
-    - fecha_fac / fecha
-    - importe_fac / importe / total
-    - proveedor
-    - num_fac / num_factura / numero_factura
     """
     if file.name.lower().endswith(".csv"):
         df = pd.read_csv(file)
@@ -159,13 +158,40 @@ def cargar_facturas(file) -> pd.DataFrame:
     return df[["Fecha", "Importe", "Proveedor", "NumFactura", "fact_id"]]
 
 
+def cargar_proveedores(file) -> pd.DataFrame:
+    """
+    Carga una agenda de proveedores con columnas:
+    Proveedor, Email
+    """
+    if file.name.lower().endswith(".csv"):
+        df = pd.read_csv(file)
+    else:
+        df = pd.read_excel(file)
+
+    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
+
+    if "proveedor" not in df.columns or "email" not in df.columns:
+        raise ValueError(
+            f"La agenda de proveedores debe tener columnas 'Proveedor' y 'Email'. "
+            f"Columnas encontradas: {df.columns.tolist()}"
+        )
+
+    df["Proveedor"] = df["proveedor"].astype(str).str.strip()
+    df["Email"] = df["email"].astype(str).str.strip()
+
+    # Clave normalizada para join
+    df["ProveedorClave"] = df["Proveedor"].str.upper().str.strip()
+
+    return df[["Proveedor", "Email", "ProveedorClave"]]
+
+
 # ==============================================
 # Clasificación por reglas (sin IA)
 # ==============================================
 
 def clasificar_por_reglas(concepto: str) -> str:
     """
-    Clasificación muy básica por reglas sobre el texto del concepto.
+    Clasificación básica por reglas sobre el texto del concepto.
     Devuelve:
       - "comision_bancaria"
       - "factura_proveedor"
@@ -227,7 +253,7 @@ def clasificar_por_reglas(concepto: str) -> str:
     ):
         return "nomina_o_seg_social"
 
-    # Proveedores típicos (ejemplo, ajusta a tu realidad)
+    # Proveedores típicos (ejemplo; ajusta a tu casuística real)
     if any(
         palabra in c
         for palabra in [
@@ -237,7 +263,7 @@ def clasificar_por_reglas(concepto: str) -> str:
             "MOVISTAR",
             "ORANGE",
             "AGUA",
-            "CANON",
+            "SUMINISTRO",
             "ALQUILER",
             "RESTAURANTE",
             "BAR ",
@@ -249,8 +275,70 @@ def clasificar_por_reglas(concepto: str) -> str:
     ):
         return "factura_proveedor"
 
-    # Por defecto
     return "otro"
+
+
+# ==============================================
+# Clasificación por IA (opcional)
+# ==============================================
+
+def clasificar_movimiento_ia(concepto: str, importe: float, fecha, client: OpenAI,
+                             model: str = "gpt-4o-mini") -> dict:
+    """
+    Llama a la IA para clasificar un solo movimiento bancario.
+    Devuelve:
+      - tipo_ia: 'comision_bancaria' | 'factura_proveedor' | 'impuesto_o_tasa' | 'nomina_o_seg_social' | 'otro'
+      - proveedor_probable: str
+      - es_factura: bool
+    """
+    if not isinstance(concepto, str):
+        concepto = str(concepto) if concepto is not None else ""
+
+    fecha_str = ""
+    if pd.notna(fecha):
+        fecha_str = str(fecha.date())
+
+    prompt = (
+        "Eres un asistente experto en contabilidad que clasifica movimientos bancarios.\n\n"
+        "Te doy un único movimiento con estos datos:\n"
+        f"- Concepto: {concepto}\n"
+        f"- Importe: {importe}\n"
+        f"- Fecha: {fecha_str}\n\n"
+        "Quiero que devuelvas SOLO un JSON con esta estructura:\n"
+        "{\n"
+        '  \"tipo\": \"comision_bancaria | factura_proveedor | impuesto_o_tasa | nomina_o_seg_social | otro\",\n'
+        '  \"proveedor_probable\": \"texto con el nombre del proveedor si aplica, o \"\" si no se sabe\",\n'
+        '  \"es_factura\": true or false\n'
+        "}\n"
+        "No añadas explicaciones, solo el JSON."
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": "Responde siempre SOLO con JSON válido."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        content = resp.choices[0].message.content.strip()
+        data = json.loads(content)
+        tipo = data.get("tipo", "otro")
+        proveedor_probable = data.get("proveedor_probable", "")
+        es_factura = bool(data.get("es_factura", False))
+        return {
+            "tipo_ia": tipo,
+            "proveedor_probable": proveedor_probable,
+            "es_factura": es_factura,
+        }
+    except Exception:
+        # En caso de error, devolvemos algo neutro
+        return {
+            "tipo_ia": "otro",
+            "proveedor_probable": "",
+            "es_factura": False,
+        }
 
 
 # ==============================================
@@ -272,14 +360,12 @@ def conciliar_1a1(
     inv = inv_df.copy()
 
     # Estructuras
-    if "Conciliada" not in bank.columns:
-        bank["Conciliada"] = False
-    else:
-        bank["Conciliada"] = False
-
+    bank["Conciliada"] = False
     bank["FacturaID"] = None
-    bank["Proveedor"] = bank.get("Proveedor", None)
-    bank["NumFactura"] = bank.get("NumFactura", None)
+    if "Proveedor" not in bank.columns:
+        bank["Proveedor"] = None
+    if "NumFactura" not in bank.columns:
+        bank["NumFactura"] = None
 
     inv["Usada"] = False
 
@@ -291,7 +377,7 @@ def conciliar_1a1(
 
     used_facts = set()
 
-    for idx, mov in gastos.iterrows():
+    for _, mov in gastos.iterrows():
         if mov["Conciliada"]:
             continue
 
@@ -342,8 +428,8 @@ def conciliar_1a1(
 # ==============================================
 
 def main():
-    st.set_page_config(page_title="Conciliador bancario limpio", layout="wide")
-    st.title("🧾 Conciliador bancario (versión sencilla + clasificación por reglas)")
+    st.set_page_config(page_title="Conciliador bancario", layout="wide")
+    st.title("🧾 Conciliador bancario (Cloud)")
 
     # ----- Sidebar -----
     st.sidebar.header("1. Subir ficheros")
@@ -352,6 +438,10 @@ def main():
     )
     file_inv = st.sidebar.file_uploader(
         "Listado de facturas (CSV/Excel)", type=["csv", "xlsx", "xls"]
+    )
+    file_prov = st.sidebar.file_uploader(
+        "Agenda de proveedores (opcional, CSV/Excel con columnas Proveedor y Email)",
+        type=["csv", "xlsx", "xls"],
     )
 
     st.sidebar.header("2. Parámetros de conciliación")
@@ -362,6 +452,27 @@ def main():
         "Tolerancia importe (céntimos)",
         options=[0.00, 0.01, 0.02, 0.05],
         value=0.00,
+    )
+
+    st.sidebar.header("3. IA (opcional)")
+    use_ai = st.sidebar.checkbox(
+        "Usar IA para clasificar cargos pendientes",
+        value=False,
+        help="La IA se usa solo sobre los cargos pendientes tras la conciliación.",
+    )
+
+    api_key_input = st.sidebar.text_input(
+        "OpenAI API Key (si no usas Secrets / variable de entorno)",
+        type="password",
+        help="Si ya tienes OPENAI_API_KEY en el sistema/Streamlit, puedes dejar esto vacío.",
+    )
+
+    max_filas_ia = st.sidebar.slider(
+        "Máx. cargos pendientes a clasificar con IA",
+        min_value=10,
+        max_value=200,
+        value=50,
+        step=10,
     )
 
     if not file_ext or not file_inv:
@@ -380,6 +491,13 @@ def main():
     except Exception as e:
         st.error(f"Error cargando/normalizando FACTURAS: {e}")
         return
+
+    prov_df = None
+    if file_prov is not None:
+        try:
+            prov_df = cargar_proveedores(file_prov)
+        except Exception as e:
+            st.warning(f"No se ha podido cargar la agenda de proveedores: {e}")
 
     st.subheader("Extracto bancario normalizado")
     st.dataframe(bank_df.head(50), use_container_width=True)
@@ -438,20 +556,14 @@ def main():
             "La conciliación generará muchos pendientes/facturas sin usar."
         )
 
-    # ----- Clasificación por reglas (sin IA) -----
+    # ----- Clasificación por reglas -----
     st.markdown("---")
     st.subheader("🧠 Clasificación por reglas (sin IA)")
-
     bank_df["tipo_regla"] = bank_df["Concepto"].apply(clasificar_por_reglas)
-
-    st.write("Ejemplos de clasificación en el extracto:")
     st.dataframe(
         bank_df[["Fecha", "Concepto", "Importe", "tipo_regla"]].head(50),
         use_container_width=True,
     )
-
-    st.markdown("---")
-    st.header("🔗 Conciliación")
 
     # ----- Conciliación -----
     bank_res, inv_res, gastos, pend, fact_sin_usar = conciliar_1a1(
@@ -465,42 +577,194 @@ def main():
     facturas_usadas = int(inv_res["Usada"].sum())
     facturas_no_usadas = len(fact_sin_usar)
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Gastos totales", total_gastos)
-    c2.metric("Gastos conciliados", conciliados)
-    c3.metric("Cargos pendientes", pendientes)
-    c4.metric("Facturas sin usar", facturas_no_usadas)
+    tab_conc, tab_recl = st.tabs(["🔗 Conciliación", "📬 Reclamaciones"])
 
-    st.subheader("Detalle de movimientos bancarios con conciliación")
-    st.dataframe(bank_res, use_container_width=True)
+    # ==========================================
+    # TAB 1: Conciliación
+    # ==========================================
+    with tab_conc:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Gastos totales", total_gastos)
+        c2.metric("Gastos conciliados", conciliados)
+        c3.metric("Cargos pendientes", pendientes)
+        c4.metric("Facturas sin usar", facturas_no_usadas)
 
-    st.subheader("🕐 Cargos pendientes (gastos sin factura asociada)")
-    if pend.empty:
-        st.success("No hay cargos pendientes. 🎉")
-    else:
-        # Resumen por tipo_regla
-        if "tipo_regla" in pend.columns:
-            n_fact = (pend["tipo_regla"] == "factura_proveedor").sum()
-            n_comis = (pend["tipo_regla"] == "comision_bancaria").sum()
-            st.write(
-                f"Pendientes clasificados por reglas: "
-                f"{n_fact} posibles **facturas de proveedor**, "
-                f"{n_comis} **comisiones bancarias**, "
-                f"{pendientes - n_fact - n_comis} otros."
-            )
+        st.subheader("Detalle de movimientos bancarios con conciliación")
+        st.dataframe(bank_res, use_container_width=True)
 
+        st.subheader("🕐 Cargos pendientes (gastos sin factura asociada)")
+        if pend.empty:
+            st.success("No hay cargos pendientes. 🎉")
+        else:
+            # Resumen por reglas
+            if "tipo_regla" in pend.columns:
+                n_fact_regla = (pend["tipo_regla"] == "factura_proveedor").sum()
+                n_comis_regla = (pend["tipo_regla"] == "comision_bancaria").sum()
+                st.write(
+                    f"Por reglas: {n_fact_regla} posibles **facturas de proveedor**, "
+                    f"{n_comis_regla} **comisiones bancarias**."
+                )
             st.dataframe(
                 pend[["RowID", "Fecha", "Concepto", "Importe", "tipo_regla"]],
                 use_container_width=True,
             )
-        else:
-            st.dataframe(pend, use_container_width=True)
 
-    st.subheader("📄 Facturas no conciliadas en el extracto")
-    if fact_sin_usar.empty:
-        st.info("Todas las facturas han sido usadas en la conciliación.")
-    else:
-        st.dataframe(fact_sin_usar, use_container_width=True)
+        st.subheader("📄 Facturas no conciliadas en el extracto")
+        if fact_sin_usar.empty:
+            st.info("Todas las facturas han sido usadas en la conciliación.")
+        else:
+            st.dataframe(fact_sin_usar, use_container_width=True)
+
+    # ==========================================
+    # TAB 2: Reclamaciones
+    # ==========================================
+    with tab_recl:
+        st.subheader("📬 Reclamaciones de cargos sin factura")
+
+        if pend.empty:
+            st.success("No hay cargos pendientes, nada que reclamar. 🎉")
+            return
+
+        # IA sobre pendientes (opcional)
+        if use_ai:
+            api_key = api_key_input.strip() or os.getenv("OPENAI_API_KEY", "").strip()
+            if not api_key:
+                st.error(
+                    "Has activado IA pero no hay API Key. "
+                    "Configura OPENAI_API_KEY en Secrets o rellena el campo en el sidebar."
+                )
+            else:
+                try:
+                    client = OpenAI(api_key=api_key)
+                    st.info(f"Clasificando con IA hasta {max_filas_ia} cargos pendientes...")
+                    resultados_ia = []
+
+                    for idx, row in pend.head(max_filas_ia).iterrows():
+                        r = clasificar_movimiento_ia(
+                            concepto=row.get("Concepto", ""),
+                            importe=row.get("Importe", 0.0),
+                            fecha=row.get("Fecha", None),
+                            client=client,
+                        )
+                        resultados_ia.append((idx, r))
+
+                    for idx, r in resultados_ia:
+                        for col in ["tipo_ia", "proveedor_probable", "es_factura"]:
+                            pend.loc[idx, col] = r[col]
+                            bank_res.loc[
+                                bank_res["RowID"] == pend.loc[idx, "RowID"], col
+                            ] = r[col]
+
+                    st.success("Clasificación por IA aplicada a los cargos pendientes seleccionados.")
+                except Exception as e:
+                    st.error(f"Error llamando a la IA: {e}")
+
+        # Determinar qué pendientes son reclamables (factura proveedor)
+        pend_recl = pend.copy()
+
+        if "es_factura" in pend_recl.columns:
+            mask_recl = pend_recl["es_factura"] == True
+        elif "tipo_ia" in pend_recl.columns:
+            mask_recl = pend_recl["tipo_ia"] == "factura_proveedor"
+        else:
+            mask_recl = pend_recl["tipo_regla"] == "factura_proveedor"
+
+        pend_recl = pend_recl[mask_recl].copy()
+
+        if pend_recl.empty:
+            st.info(
+                "No hay cargos pendientes que la IA o las reglas identifiquen como 'factura de proveedor'. "
+                "Revisa la clasificación o ajusta la ventana de fechas."
+            )
+            return
+
+        # Clave de proveedor probable para join con agenda (si existe)
+        if "proveedor_probable" in pend_recl.columns:
+            pend_recl["ProveedorProbable"] = pend_recl["proveedor_probable"].fillna("").astype(str).str.strip()
+        else:
+            pend_recl["ProveedorProbable"] = ""
+
+        pend_recl["ProveedorClave"] = pend_recl["ProveedorProbable"].str.upper().str.strip()
+
+        # Join con agenda de proveedores (si hay)
+        if prov_df is not None:
+            pend_recl = pend_recl.merge(
+                prov_df[["Proveedor", "Email", "ProveedorClave"]],
+                on="ProveedorClave",
+                how="left",
+                suffixes=("", "_agenda"),
+            )
+        else:
+            pend_recl["Proveedor"] = pend_recl.get("ProveedorProbable", "")
+            pend_recl["Email"] = ""
+
+        # Generar texto de email
+        def generar_email(row):
+            fecha = row.get("Fecha", None)
+            fecha_txt = (
+                fecha.strftime("%d/%m/%Y") if isinstance(fecha, pd.Timestamp) else ""
+            )
+            imp = row.get("Importe", 0.0)
+            imp_abs = abs(float(imp)) if pd.notna(imp) else 0.0
+            proveedor = row.get("ProveedorProbable", "") or row.get("Proveedor", "")
+            concepto = row.get("Concepto", "")
+
+            saludo_prov = f"{proveedor}," if proveedor else ""
+            cuerpo = (
+                f"Buenas {saludo_prov}\n\n"
+                f"¿Nos pueden enviar la factura correspondiente al cargo bancario "
+                f"de fecha {fecha_txt} e importe {imp_abs:.2f} €"
+            )
+            if concepto:
+                cuerpo += f" (concepto: {concepto})"
+            cuerpo += "?\n\nMuchas gracias.\n\nUn saludo."
+
+            return cuerpo
+
+        pend_recl["TextoEmail"] = pend_recl.apply(generar_email, axis=1)
+
+        st.write(
+            f"Se han identificado **{len(pend_recl)} cargos** pendientes como "
+            f"posibles facturas de proveedor susceptibles de reclamación."
+        )
+
+        cols_vista = [
+            "RowID",
+            "Fecha",
+            "Concepto",
+            "Importe",
+            "tipo_regla",
+        ]
+        for extra in ["tipo_ia", "ProveedorProbable", "Proveedor", "Email", "TextoEmail"]:
+            if extra in pend_recl.columns:
+                cols_vista.append(extra)
+
+        st.dataframe(
+            pend_recl[cols_vista],
+            use_container_width=True,
+        )
+
+        # Descarga en Excel
+        try:
+            import io
+
+            with io.BytesIO() as buf:
+                with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+                    pend_recl[cols_vista].to_excel(
+                        writer, index=False, sheet_name="Reclamaciones"
+                    )
+                data_xlsx = buf.getvalue()
+            st.download_button(
+                "⬇️ Descargar listado de reclamaciones (XLSX)",
+                data=data_xlsx,
+                file_name="reclamaciones_conciliador.xlsx",
+                mime=(
+                    "application/vnd.openxmlformats-"
+                    "officedocument.spreadsheetml.sheet"
+                ),
+            )
+        except Exception as e:
+            st.warning(f"No se ha podido generar el Excel de reclamaciones: {e}")
 
 
 if __name__ == "__main__":
